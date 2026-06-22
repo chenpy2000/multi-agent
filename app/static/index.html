@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Multi-Agent Prototype</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">MA</div>
+          <div>
+            <strong>Multi-Agent</strong>
+            <span>Coding prototype</span>
+          </div>
+        </div>
+        <nav class="nav-tabs">
+          <button class="nav-tab is-active" data-view="chat" type="button">Chat</button>
+          <button class="nav-tab" data-view="agents" type="button">Agents</button>
+        </nav>
+        <div class="run-list">
+          <div class="section-label">Runs</div>
+          <div id="runList" class="run-list-items"></div>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <section id="chatView" class="view is-active" aria-labelledby="chatTitle">
+          <header class="topbar">
+            <div>
+              <h1 id="chatTitle">Ask the orchestrator</h1>
+              <p id="runSubtitle">Describe a coding task and watch the workflow form.</p>
+            </div>
+            <span id="runStatus" class="status-badge">Idle</span>
+          </header>
+
+          <div class="workflow-strip" id="workflowStrip" aria-label="Workflow"></div>
+
+          <div id="chatLog" class="chat-log" aria-live="polite">
+            <article class="message assistant">
+              <div class="avatar">O</div>
+              <div class="bubble">
+                <strong>Orchestrator</strong>
+                <p>Send a coding request. I will design a workflow and assign agents to the work.</p>
+              </div>
+            </article>
+          </div>
+
+          <form id="requestForm" class="composer">
+            <textarea id="promptInput" rows="1" placeholder="Build a README generator with tests and a small web UI"></textarea>
+            <button id="sendButton" type="submit">Send</button>
+          </form>
+        </section>
+
+        <section id="agentsView" class="view" aria-labelledby="agentsTitle">
+          <header class="topbar">
+            <div>
+              <h1 id="agentsTitle">Agents</h1>
+              <p>Inspect ownership, inputs, outputs, and inter-agent chat.</p>
+            </div>
+            <div class="topbar-actions">
+              <span id="frameworkBadge" class="framework-badge">Native runtime</span>
+              <button id="nudgeButton" class="secondary-button" type="button" disabled>Nudge agents</button>
+            </div>
+          </header>
+          <div id="agentGrid" class="agent-grid"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
