@@ -849,6 +849,153 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertLess(agent_names.index("Frontend Sub-Orchestrator"), agent_names.index("Gameplay Engineer"))
                 self.assertIn("Verification: passed", run.summary)
 
+    def test_direct_specialist_runs_in_parallel_with_sub_orchestrators(self) -> None:
+        system_started = Event()
+        frontend_started = Event()
+        backend_started = Event()
+        timings: dict[str, float] = {}
+        timing_lock = Lock()
+
+        def fake_mixed_hierarchy_agent(
+            name: str,
+            instructions: str,
+            input_text: str,
+            max_tokens: int,
+            tools: list | None = None,
+            timeout: int = 120,
+        ) -> str:
+            if name == "Orchestrator":
+                return json.dumps(
+                    {
+                        "project_name": "mixed-hierarchy-project",
+                        "project_summary": "A project with direct and sub-orchestrated work.",
+                        "complexity": "large",
+                        "estimated_files": 6,
+                        "requires_sub_orchestrators": True,
+                        "acceptance_criteria": ["Run direct planning work while domains are being planned"],
+                        "sub_orchestrators": [
+                            {
+                                "name": "Frontend Sub-Orchestrator",
+                                "domain": "frontend",
+                                "purpose": "Plan frontend specialists.",
+                                "task": "Create frontend specialists.",
+                                "input": "Frontend domain.",
+                                "input_format": "Root plan.",
+                                "expected_output_format": "JSON agents.",
+                                "logic": "Split UI work.",
+                                "deliverable": "Frontend plan.",
+                            },
+                            {
+                                "name": "Backend Sub-Orchestrator",
+                                "domain": "backend",
+                                "purpose": "Plan backend specialists.",
+                                "task": "Create backend specialists.",
+                                "input": "Backend domain.",
+                                "input_format": "Root plan.",
+                                "expected_output_format": "JSON agents.",
+                                "logic": "Split API work.",
+                                "deliverable": "Backend plan.",
+                            },
+                        ],
+                        "agents": [
+                            {
+                                "name": "System Designer",
+                                "purpose": "Define cross-cutting full-stack contracts.",
+                                "task": "Write the full-stack spec while domain orchestrators plan.",
+                                "input": "Root requirements.",
+                                "input_format": "Root plan.",
+                                "expected_output_format": "SPEC.md.",
+                                "logic": "Define shared interfaces.",
+                                "deliverable": "SPEC.md.",
+                                "depends_on": [],
+                            }
+                        ],
+                    }
+                )
+            if name == "Frontend Sub-Orchestrator":
+                with timing_lock:
+                    timings["frontend_start"] = time.perf_counter()
+                frontend_started.set()
+                if not system_started.wait(1):
+                    raise AssertionError("System Designer did not run while Frontend Sub-Orchestrator was planning.")
+                with timing_lock:
+                    timings["frontend_end"] = time.perf_counter()
+                return json.dumps(
+                    {
+                        "agents": [
+                            {
+                                "name": "Frontend Engineer",
+                                "purpose": "Create UI.",
+                                "task": "Write index.html.",
+                                "input": "Frontend plan.",
+                                "input_format": "Plan.",
+                                "expected_output_format": "index.html.",
+                                "logic": "Write UI shell.",
+                                "deliverable": "index.html.",
+                            }
+                        ]
+                    }
+                )
+            if name == "Backend Sub-Orchestrator":
+                with timing_lock:
+                    timings["backend_start"] = time.perf_counter()
+                backend_started.set()
+                if not system_started.wait(1):
+                    raise AssertionError("System Designer did not run while Backend Sub-Orchestrator was planning.")
+                return json.dumps(
+                    {
+                        "agents": [
+                            {
+                                "name": "Backend Engineer",
+                                "purpose": "Create backend module.",
+                                "task": "Write api.py.",
+                                "input": "Backend plan.",
+                                "input_format": "Plan.",
+                                "expected_output_format": "api.py.",
+                                "logic": "Write API module.",
+                                "deliverable": "api.py.",
+                            }
+                        ]
+                    }
+                )
+            if name == "System Designer":
+                with timing_lock:
+                    timings["system_start"] = time.perf_counter()
+                system_started.set()
+                if not frontend_started.wait(1) or not backend_started.wait(1):
+                    raise AssertionError("System Designer did not overlap with both sub-orchestrators.")
+                _call_tool(tools or [], "write_file", "SPEC.md", "# Spec\n\nShared contract.\n")
+                with timing_lock:
+                    timings["system_end"] = time.perf_counter()
+                return "Wrote SPEC.md."
+            if name == "Frontend Engineer":
+                _call_tool(tools or [], "write_file", "index.html", "<!doctype html>\n")
+                return "Wrote index.html."
+            if name == "Backend Engineer":
+                _call_tool(tools or [], "write_file", "api.py", "def ok():\n    return True\n")
+                return "Wrote api.py."
+            if name == "Project Builder":
+                _call_tool(tools or [], "read_file", "SPEC.md")
+                return "Inspected all files."
+            if name == "Review Agent":
+                return "Reviewed mixed hierarchy project."
+            return f"{name} output"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("app.project_runtime.GENERATED_ROOT", Path(temp_dir)):
+                with patch("app.project_runtime._run_llama_agent", fake_mixed_hierarchy_agent):
+                    run = Run(prompt="Create a mixed full-stack project")
+                    run_workflow(run, delay=0)
+
+                self.assertEqual(run.status, "complete")
+                project_dir = Path(run.project_path)
+                self.assertTrue((project_dir / "SPEC.md").exists())
+                self.assertTrue((project_dir / "index.html").exists())
+                self.assertTrue((project_dir / "api.py").exists())
+                self.assertLess(timings["system_start"], timings["frontend_end"])
+                system_designer = next(agent for agent in run.agents if agent.name == "System Designer")
+                self.assertEqual(system_designer.status, "done")
+
     def test_independent_specialists_run_in_parallel_before_dependents(self) -> None:
         spec_started = Event()
         ui_started = Event()

@@ -36,7 +36,7 @@ MAX_FILES = 80
 MAX_FILE_CHARS = 250_000
 MAX_DIRECT_AGENTS = 8
 MAX_SUB_ORCHESTRATORS = 4
-MAX_TOTAL_SPECIALISTS = 12
+MAX_TOTAL_SPECIALISTS = 25
 PLANNER_TIMEOUT_SECONDS = 180
 SUB_ORCHESTRATOR_TIMEOUT_SECONDS = 240
 COORDINATOR_TIMEOUT_SECONDS = 900
@@ -326,15 +326,54 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
         *(agent.name.lower() for agent in sub_orchestrator_agents),
         *(agent.name.lower() for agent in specialist_agents),
     }
-    for planned_sub_orchestrator, sub_orchestrator, planned_specialists in _run_sub_orchestrator_dag(
-        run.prompt,
-        plan,
-        sub_orchestrator_agents,
-        workspace,
-        orchestrator,
-        emit,
-        used_specialist_names,
-    ):
+    run.status = "running"
+    specialist_outputs: list[str] = []
+    early_execution_summary = ""
+    if sub_orchestrator_agents and specialist_agents:
+        parallel_emit_lock = Lock()
+
+        def parallel_emit(message: Message, agent: Agent | None = None) -> None:
+            with parallel_emit_lock:
+                emit(message, agent)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            sub_future = executor.submit(
+                _run_sub_orchestrator_dag,
+                run.prompt,
+                plan,
+                sub_orchestrator_agents,
+                workspace,
+                orchestrator,
+                parallel_emit,
+                used_specialist_names,
+            )
+            specialist_future = executor.submit(
+                _run_specialist_dag,
+                run.prompt,
+                plan,
+                specialist_agents,
+                specialist_outputs,
+                workspace,
+                orchestrator,
+                parallel_emit,
+                relationship_agent,
+                run,
+            )
+            planned_sub_orchestrator_results = sub_future.result()
+            early_execution_summary = specialist_future.result()
+    else:
+        planned_sub_orchestrator_results = _run_sub_orchestrator_dag(
+            run.prompt,
+            plan,
+            sub_orchestrator_agents,
+            workspace,
+            orchestrator,
+            emit,
+            used_specialist_names,
+        )
+
+    sub_orchestrator_specialists: list[Agent] = []
+    for planned_sub_orchestrator, sub_orchestrator, planned_specialists in planned_sub_orchestrator_results:
         if len(specialist_agents) + len(planned_specialists) > MAX_TOTAL_SPECIALISTS:
             raise ProjectRuntimeError(
                 f"Sub-orchestrators produced too many specialists: "
@@ -347,6 +386,7 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
                 new_specialist.name,
             )
         specialist_agents.extend(new_specialists)
+        sub_orchestrator_specialists.extend(new_specialists)
         used_specialist_names.update(agent.name.lower() for agent in new_specialists)
         sub_orchestrator.output = _sub_orchestrator_summary(planned_sub_orchestrator, planned_specialists)
         _mark_done(run, sub_orchestrator, emit)
@@ -362,13 +402,11 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
             content="Assigned dynamic agents: " + ", ".join(agent.name for agent in specialist_agents),
         )
     )
-
-    run.status = "running"
-    specialist_outputs: list[str] = []
-    execution_summary = _run_specialist_dag(
+    remaining_specialists = sub_orchestrator_specialists if early_execution_summary else specialist_agents
+    later_execution_summary = _run_specialist_dag(
         run.prompt,
         plan,
-        specialist_agents,
+        remaining_specialists,
         specialist_outputs,
         workspace,
         orchestrator,
@@ -376,6 +414,7 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
         relationship_agent,
         run,
     )
+    execution_summary = _combine_execution_summaries(early_execution_summary, later_execution_summary)
     orchestrator.output = f"{orchestrator.output}\n\nDAG execution result:\n{execution_summary}"
     emit(Message(sender="Orchestrator", recipient="all", kind="agent", content=execution_summary), orchestrator)
 
@@ -1080,6 +1119,14 @@ def _run_specialist_dag(
         summaries.append(f"Level {level_index}: {level_names}")
 
     return "Ran specialist DAG:\n" + "\n".join(f"- {item}" for item in summaries)
+
+
+def _combine_execution_summaries(early_summary: str, later_summary: str) -> str:
+    if early_summary and later_summary and later_summary != "No specialist agents were required.":
+        return f"Root direct specialists:\n{early_summary}\n\nSub-orchestrator specialists:\n{later_summary}"
+    if early_summary:
+        return early_summary
+    return later_summary
 
 
 def _agent_execution_levels(agents: list[Agent]) -> list[list[Agent]]:
