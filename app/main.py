@@ -13,6 +13,8 @@ from app.frameworks import current_framework_profile
 from app.llm import LLMConfigError, LLMRequestError, ask_openai, load_dotenv, require_openai_config
 from app.models import Run
 from app.orchestrator import RunStore, manual_agent_message, run_workflow
+from app.project_registry import delete_project, list_projects, project_exists, rename_project
+from app.project_runtime import ProjectRuntimeError
 
 
 ROOT = Path(__file__).resolve().parent
@@ -33,6 +35,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_json([run.to_dict() for run in STORE.list()])
         elif path == "/api/framework":
             self._send_json(current_framework_profile().to_dict())
+        elif path == "/api/projects":
+            self._send_json(list_projects())
         elif path.startswith("/api/runs/"):
             run_id = path.split("/", 3)[3]
             run = STORE.get(run_id)
@@ -40,6 +44,22 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_error(HTTPStatus.NOT_FOUND, "Run not found.")
             else:
                 self._send_json(run.to_dict())
+        else:
+            self._send_error(HTTPStatus.NOT_FOUND, "Route not found.")
+
+    def do_PATCH(self) -> None:
+        path = urlparse(self.path).path
+        if path.startswith("/api/projects/"):
+            project_name = unquote(path.split("/", 3)[3])
+            self._rename_project(project_name)
+        else:
+            self._send_error(HTTPStatus.NOT_FOUND, "Route not found.")
+
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        if path.startswith("/api/projects/"):
+            project_name = unquote(path.split("/", 3)[3])
+            self._delete_project(project_name)
         else:
             self._send_error(HTTPStatus.NOT_FOUND, "Route not found.")
 
@@ -62,6 +82,10 @@ class AppHandler(BaseHTTPRequestHandler):
         if not prompt:
             self._send_error(HTTPStatus.BAD_REQUEST, "Prompt is required.")
             return
+        selected_project = str(data.get("selected_project", "")).strip()
+        if selected_project and not project_exists(selected_project):
+            self._send_error(HTTPStatus.NOT_FOUND, f"Project not found: {selected_project}")
+            return
         try:
             require_openai_config()
         except (LLMConfigError, LLMRequestError) as exc:
@@ -69,11 +93,33 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         framework = current_framework_profile()
-        run = Run(prompt=prompt, framework=framework.active, framework_note=framework.rationale)
+        run = Run(
+            prompt=prompt,
+            framework=framework.active,
+            framework_note=framework.rationale,
+            selected_project=selected_project,
+        )
         STORE.add(run)
         thread = threading.Thread(target=run_workflow, args=(run, STORE.update), daemon=True)
         thread.start()
         self._send_json(run.to_dict(), HTTPStatus.CREATED)
+
+    def _rename_project(self, project_name: str) -> None:
+        data = self._read_json()
+        try:
+            project = rename_project(project_name, str(data.get("name", "")).strip())
+        except ProjectRuntimeError as exc:
+            self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        self._send_json(project)
+
+    def _delete_project(self, project_name: str) -> None:
+        try:
+            delete_project(project_name)
+        except ProjectRuntimeError as exc:
+            self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        self._send_json({"deleted": project_name})
 
     def _create_message(self, run_id: str) -> None:
         run = STORE.get(run_id)

@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -11,11 +12,22 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 from typing import Any
 
+from llama_index.core.schema import Document
+
+from app.code_index import ProjectCodeIndex, build_project_code_index, refresh_project_code_index_files
 from app.llama_runtime import ToolFunction, run_llama_agent
 from app.models import Agent, Message, Run, now_iso
+from app.repo_intake import RepoIntake, build_repo_intake, search_project_files
+from app.relationship_map import (
+    RelationshipMapUpdate,
+    build_relationship_map_evidence,
+    parse_relationship_map_response,
+    relationship_map_context,
+    relationship_map_document,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -151,6 +163,8 @@ def project_agent_plan(prompt: str) -> list[Agent]:
 def run_project_workflow(run: Run, emit: Emitter) -> None:
     GENERATED_ROOT.mkdir(parents=True, exist_ok=True)
     run.status = "planning"
+    selected_project = _slugify(run.selected_project)
+    run.project_mode = "existing" if selected_project else "new"
 
     orchestrator = Agent(
         name="Orchestrator",
@@ -158,7 +172,53 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
         task="Assign specialist agents and subtasks from the user's chat request.",
         input=run.prompt,
     )
-    run.agents = [orchestrator]
+    workspace: ProjectWorkspace | None = None
+    repo_intake: RepoIntake | None = None
+    intake_agent: Agent | None = None
+    code_index_agent: Agent | None = None
+    relationship_agent: Agent | None = None
+    if selected_project:
+        workspace = ProjectWorkspace(selected_project, reuse_existing=True)
+        workspace.ensure_created()
+        repo_intake = build_repo_intake(workspace.project_dir, selected_project)
+        run.repo_summary = repo_intake.to_prompt_context()
+        workspace.repo_intake_context = run.repo_summary
+        intake_agent = Agent(
+            name="Repository Intake Agent",
+            purpose="Map the selected existing project before planning changes.",
+            task="Scan files, manifests, docs, entrypoints, and likely verification commands.",
+            input=f"Selected project: {selected_project}",
+            input_format="Existing generated project folder.",
+            expected_output_format="Compact repo map for brownfield planning.",
+            logic="Deterministically inspect the selected folder and summarize useful project context.",
+            deliverable="Repo intake summary for the Orchestrator and specialist agents.",
+        )
+        code_index_agent = Agent(
+            name="Code Index Agent",
+            purpose="Build a navigable code index for the selected project.",
+            task="Index text/code files, symbols, imports, selectors, and snippets before planning.",
+            input=f"Selected project: {selected_project}",
+            input_format="Existing generated project folder plus repository intake summary.",
+            expected_output_format="Code index summary with important files and symbols.",
+            logic="Create local LlamaIndex Document entries and symbol/import summaries for coding agents.",
+            deliverable="Code index summary for the Relationship Map Agent and specialists.",
+            depends_on=[intake_agent.name],
+        )
+        relationship_agent = Agent(
+            name="Relationship Map Agent",
+            purpose="Build and refresh the direct file relationship map for the selected project.",
+            task="Read selected project files and summarize direct file relationships for orchestration and coding agents.",
+            input=f"Selected project: {selected_project}",
+            input_format="List of workspace-relative files to inspect.",
+            expected_output_format="Natural-language relationship map stored as LlamaIndex Document objects.",
+            logic="Update only selected files' relationship entries, preserving unchanged map entries.",
+            deliverable="Current direct relationship map for the Orchestrator, specialists, and builder.",
+            depends_on=[code_index_agent.name],
+        )
+        orchestrator.depends_on = [relationship_agent.name]
+        run.agents = [intake_agent, code_index_agent, relationship_agent, orchestrator]
+    else:
+        run.agents = [orchestrator]
     emit(
         Message(
             sender="Orchestrator",
@@ -171,18 +231,46 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
         )
     )
 
+    if intake_agent and repo_intake:
+        _start_agent(intake_agent, emit)
+        intake_agent.output = repo_intake.to_prompt_context()
+        _mark_done(run, intake_agent, emit)
+    if code_index_agent and workspace:
+        _start_agent(code_index_agent, emit)
+        code_index = workspace.build_code_index()
+        run.code_index_summary = code_index.to_prompt_context()
+        code_index_agent.output = run.code_index_summary
+        _mark_done(run, code_index_agent, emit)
+    if relationship_agent and workspace:
+        _run_relationship_map_agent(
+            workspace,
+            relationship_agent,
+            workspace.list_files(),
+            run,
+            emit,
+            "Initial relationship map for the selected existing project.",
+        )
+
     _start_agent(orchestrator, emit)
     plan_text = _run_llama_agent(
         orchestrator.name,
         _orchestrator_instructions(),
-        f"User request:\n{run.prompt}",
+        _orchestrator_input(
+            run.prompt,
+            selected_project,
+            repo_intake,
+            workspace.code_index_context if workspace else "",
+        ),
+        tools=[_relationship_graph_tool(workspace)] if workspace and workspace.reuse_existing else None,
         max_tokens=2600,
         timeout=PLANNER_TIMEOUT_SECONDS,
     )
     plan = parse_workflow_plan(plan_text, run.prompt)
-    workspace = ProjectWorkspace(plan.project_name)
-    workspace.ensure_created()
-    orchestrator.output = f"{_plan_summary(plan)}\n\nProject workspace: {workspace.project_dir}"
+    if workspace is None:
+        workspace = ProjectWorkspace(plan.project_name)
+        workspace.ensure_created()
+    mode = f"Continuing existing project: {selected_project}" if selected_project else "Creating a new project from scratch"
+    orchestrator.output = f"{_plan_summary(plan)}\n\n{mode}\nProject workspace: {workspace.project_dir}"
     _mark_done(run, orchestrator, emit)
 
     sub_orchestrator_agents = [_agent_from_sub_orchestrator(item) for item in plan.sub_orchestrators]
@@ -195,7 +283,11 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
         name="Project Builder",
         purpose="Consolidate all specialist deliverables into a complete source tree.",
         task="Generate every required project file as a JSON file manifest.",
-        input=f"Project name: {plan.project_name}. File tools must receive workspace-relative paths only.",
+        input=(
+            f"Selected existing project: {selected_project}. File tools must receive workspace-relative paths only."
+            if selected_project
+            else f"Project name: {plan.project_name}. File tools must receive workspace-relative paths only."
+        ),
         depends_on=[agent.name for agent in specialist_agents] or [agent.name for agent in sub_orchestrator_agents] or ["Orchestrator"],
     )
     verifier = Agent(
@@ -212,7 +304,8 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
         input="Written files and verification output.",
         depends_on=["Verification Agent"],
     )
-    run.agents = [orchestrator, *sub_orchestrator_agents, *specialist_agents, builder, verifier, reviewer]
+    intake_agents = [agent for agent in (intake_agent, code_index_agent, relationship_agent) if agent is not None]
+    run.agents = [*intake_agents, orchestrator, *sub_orchestrator_agents, *specialist_agents, builder, verifier, reviewer]
     _assign_agent_dag_layers(run.agents)
     if sub_orchestrator_agents:
         emit(
@@ -229,6 +322,7 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
         "project builder",
         "verification agent",
         "review agent",
+        "relationship map agent",
         *(agent.name.lower() for agent in sub_orchestrator_agents),
         *(agent.name.lower() for agent in specialist_agents),
     }
@@ -258,7 +352,7 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
         _mark_done(run, sub_orchestrator, emit)
 
     builder.depends_on = [agent.name for agent in specialist_agents] or [agent.name for agent in sub_orchestrator_agents] or ["Orchestrator"]
-    run.agents = [orchestrator, *sub_orchestrator_agents, *specialist_agents, builder, verifier, reviewer]
+    run.agents = [*intake_agents, orchestrator, *sub_orchestrator_agents, *specialist_agents, builder, verifier, reviewer]
     _assign_agent_dag_layers(run.agents)
     emit(
         Message(
@@ -279,6 +373,8 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
         workspace,
         orchestrator,
         emit,
+        relationship_agent,
+        run,
     )
     orchestrator.output = f"{orchestrator.output}\n\nDAG execution result:\n{execution_summary}"
     emit(Message(sender="Orchestrator", recipient="all", kind="agent", content=execution_summary), orchestrator)
@@ -295,12 +391,23 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
         timeout=BUILDER_TIMEOUT_SECONDS,
     )
     _mark_done(run, builder, emit)
+    if relationship_agent and workspace.relationship_dirty_files():
+        _run_relationship_map_agent(
+            workspace,
+            relationship_agent,
+            workspace.relationship_dirty_files(),
+            run,
+            emit,
+            "Refresh after Project Builder changes.",
+        )
     _emit_handoff(builder, verifier, "Verify the generated files from disk.", emit)
 
     _start_agent(verifier, emit)
     written = workspace.list_files()
     verification = workspace.verify()
-    verifier.output = _verification_report(workspace.project_dir, written, verification)
+    changes = workspace.change_summary()
+    run.modified_files = changes
+    verifier.output = _verification_report(workspace.project_dir, written, verification, changes)
     run.project_path = str(workspace.project_dir)
     run.artifacts = [
         {"name": file_path, "description": str(workspace.project_dir / file_path)}
@@ -318,18 +425,22 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
             f"Workflow plan:\n{_plan_summary(plan)}\n\n"
             f"Generated project folder:\n{workspace.project_dir}\n\n"
             f"Generated files:\n{json.dumps(written, indent=2)}\n\n"
+            f"Changed files:\n{json.dumps(changes, indent=2)}\n\n"
             f"Verification output:\n{verification}"
         ),
-        tools=[_list_files_tool(workspace)],
+        tools=[_list_files_tool(workspace), _relationship_graph_tool(workspace)],
         max_tokens=1400,
         timeout=REVIEW_TIMEOUT_SECONDS,
     )
     _mark_done(run, reviewer, emit)
 
     run.status = "complete"
+    verb = "Updated existing project" if selected_project else "Generated project"
+    file_count_text = f"Project contains {len(written)} files" if selected_project else f"Wrote {len(written)} files"
     run.summary = (
-        f"Generated project at {workspace.project_dir}. "
-        f"Wrote {len(written)} files for request-shaped project '{plan.project_name}'. "
+        f"{verb} at {workspace.project_dir}. "
+        f"{file_count_text} for request-shaped project '{plan.project_name}'. "
+        f"Changes: {_change_status(changes)}. "
         f"Verification: {_verification_status(verification)}. "
         f"Review: {reviewer.output}"
     )
@@ -360,7 +471,7 @@ def parse_workflow_plan(text: str, prompt: str) -> WorkflowPlan:
         )
     requires_sub_orchestrators = bool(payload.get("requires_sub_orchestrators")) or bool(raw_sub_orchestrators)
 
-    used_names = {"orchestrator", "project builder", "verification agent", "review agent"}
+    used_names = {"orchestrator", "project builder", "verification agent", "review agent", "relationship map agent"}
     sub_orchestrators = _parse_sub_orchestrators(raw_sub_orchestrators, used_names)
     planned = _parse_planned_agents(raw_agents, "Orchestrator", used_names)
 
@@ -535,13 +646,28 @@ def parse_specialist_result(text: str, agent_name: str) -> SpecialistResult:
 
 
 class ProjectWorkspace:
-    def __init__(self, requested_name: str) -> None:
+    def __init__(self, requested_name: str, reuse_existing: bool = False) -> None:
         self.name = _slugify(requested_name) or "generated-project"
-        self.project_dir = self._unique_project_dir(self.name)
-        self._lock = Lock()
+        self.reuse_existing = reuse_existing
+        self.project_dir = self._existing_project_dir(self.name) if reuse_existing else self._unique_project_dir(self.name)
+        self.repo_intake_context = ""
+        self.code_index_context = ""
+        self.relationship_map_context = ""
+        self.relationship_map_entries: dict[str, str] = {}
+        self.relationship_map_documents: dict[str, Document] = {}
+        self.relationship_map_document: Document | None = None
+        self._code_index: ProjectCodeIndex | None = None
+        self._code_index_dirty_files: set[str] = set()
+        self._relationship_dirty_files: set[str] = set()
+        self._baseline_hashes: dict[str, str] = {}
+        self._baseline_captured = False
+        self._lock = RLock()
 
     def ensure_created(self) -> None:
         self.project_dir.mkdir(parents=True, exist_ok=True)
+        if not self._baseline_captured:
+            self._baseline_hashes = self._snapshot_hashes() if self.reuse_existing else {}
+            self._baseline_captured = True
 
     def write_files(self, files: list[GeneratedFile]) -> list[str]:
         self.ensure_created()
@@ -557,7 +683,9 @@ class ProjectWorkspace:
             destination = self._resolve_file(relative_path)
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(content, encoding="utf-8", newline="\n")
-            return destination.relative_to(self.project_dir).as_posix()
+            written = destination.relative_to(self.project_dir).as_posix()
+            self._mark_project_file_dirty(written)
+            return written
 
     def append_file(self, relative_path: str, content: str) -> str:
         if len(content) > MAX_FILE_CHARS:
@@ -567,7 +695,9 @@ class ProjectWorkspace:
             destination.parent.mkdir(parents=True, exist_ok=True)
             with destination.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
-            return destination.relative_to(self.project_dir).as_posix()
+            written = destination.relative_to(self.project_dir).as_posix()
+            self._mark_project_file_dirty(written)
+            return written
 
     def read_file(self, relative_path: str) -> str:
         with self._lock:
@@ -588,6 +718,82 @@ class ProjectWorkspace:
                 for path in self.project_dir.rglob("*")
                 if path.is_file()
             )
+
+    def search_files(self, query: str, max_results: int = 8) -> list[dict[str, str]]:
+        with self._lock:
+            return search_project_files(self.project_dir, query, max_results=max(1, min(max_results, 20)))
+
+    def build_code_index(self) -> ProjectCodeIndex:
+        with self._lock:
+            self._code_index = build_project_code_index(self.project_dir)
+            self.code_index_context = self._code_index.to_prompt_context()
+            self._code_index_dirty_files.clear()
+            return self._code_index
+
+    def code_index(self) -> ProjectCodeIndex:
+        with self._lock:
+            if self._code_index is None:
+                return self.build_code_index()
+            return self._code_index
+
+    def refresh_project_documents(self, selected_files: list[str]) -> None:
+        if not selected_files:
+            return
+        with self._lock:
+            if self._code_index is None:
+                self._code_index = build_project_code_index(self.project_dir)
+            else:
+                refresh_project_code_index_files(self._code_index, selected_files)
+            self.code_index_context = self._code_index.to_prompt_context()
+            self._code_index_dirty_files.difference_update(selected_files)
+            self._sync_code_index_documents()
+
+    def apply_relationship_map_update(self, update: RelationshipMapUpdate, selected_files: list[str]) -> str:
+        with self._lock:
+            for path in update.removed:
+                self.relationship_map_entries.pop(path, None)
+                self.relationship_map_documents.pop(path, None)
+            for path, entry in update.entries.items():
+                self.relationship_map_entries[path] = entry.summary
+                self.relationship_map_documents[path] = entry.document
+            self.relationship_map_context = relationship_map_context(self.relationship_map_entries)
+            self.relationship_map_document = relationship_map_document(self.relationship_map_entries)
+            self._relationship_dirty_files.difference_update(selected_files)
+            self._sync_code_index_documents()
+            return self.relationship_map_context
+
+    def relationship_dirty_files(self) -> list[str]:
+        with self._lock:
+            return sorted(self._relationship_dirty_files)
+
+    def relationship_graph(self) -> str:
+        return self.relationship_map_context or "Project relationship map:\n- No relationship map is available for this workspace."
+
+    def _mark_project_file_dirty(self, relative_path: str) -> None:
+        self._code_index_dirty_files.add(relative_path)
+        if self.reuse_existing:
+            self._relationship_dirty_files.add(relative_path)
+
+    def _sync_code_index_documents(self) -> None:
+        if self._code_index is None:
+            return
+        documents = [self._code_index.file_documents[path] for path in sorted(self._code_index.file_documents)]
+        documents.extend(self.relationship_map_documents[path] for path in sorted(self.relationship_map_documents))
+        if self.relationship_map_document is not None:
+            documents.append(self.relationship_map_document)
+        self._code_index.documents = documents
+
+    def change_summary(self) -> dict[str, list[str]]:
+        with self._lock:
+            current = self._snapshot_hashes()
+        created = sorted(path for path in current if path not in self._baseline_hashes)
+        modified = sorted(
+            path
+            for path, digest in current.items()
+            if path in self._baseline_hashes and self._baseline_hashes[path] != digest
+        )
+        deleted = sorted(path for path in self._baseline_hashes if path not in current)
+        return {"created": created, "modified": modified, "deleted": deleted}
 
     def verify(self) -> str:
         outputs: list[str] = []
@@ -680,6 +886,19 @@ class ProjectWorkspace:
         status = "passed" if result.returncode == 0 else f"failed ({result.returncode})"
         return f"$ {command_text}\n{status}\n{output}".strip()
 
+    def _snapshot_hashes(self) -> dict[str, str]:
+        if not self.project_dir.exists():
+            return {}
+        hashes: dict[str, str] = {}
+        for relative_path in self.list_files():
+            path = self.project_dir / relative_path
+            try:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                continue
+            hashes[relative_path] = digest
+        return hashes
+
     @staticmethod
     def _unique_project_dir(base_name: str) -> Path:
         candidate = GENERATED_ROOT / base_name
@@ -691,6 +910,17 @@ class ProjectWorkspace:
             if not candidate.exists():
                 return candidate
             index += 1
+
+    @staticmethod
+    def _existing_project_dir(base_name: str) -> Path:
+        candidate = (GENERATED_ROOT / base_name).resolve()
+        try:
+            candidate.relative_to(GENERATED_ROOT.resolve())
+        except ValueError as exc:
+            raise ProjectRuntimeError(f"Unsafe project name: {base_name}") from exc
+        if not candidate.is_dir():
+            raise ProjectRuntimeError(f"Selected project not found: {base_name}")
+        return candidate
 
 
 def _run_llama_agent(
@@ -738,7 +968,7 @@ def _run_sub_orchestrator_dag(
                 _sub_orchestrator_instructions(planned_sub_orchestrator, plan),
                 _sub_orchestrator_input(user_prompt, plan, planned_sub_orchestrator, workspace),
                 2400,
-                None,
+                [_relationship_graph_tool(workspace)] if workspace.reuse_existing else None,
                 SUB_ORCHESTRATOR_TIMEOUT_SECONDS,
             )
             futures[future] = sub_orchestrator
@@ -771,6 +1001,8 @@ def _run_specialist_dag(
     workspace: ProjectWorkspace,
     orchestrator: Agent,
     emit: Emitter,
+    relationship_agent: Agent | None = None,
+    run: Run | None = None,
 ) -> str:
     if not specialist_agents:
         return "No specialist agents were required."
@@ -815,6 +1047,15 @@ def _run_specialist_dag(
                     agent.finished_at = now_iso()
                     raise
             specialist_outputs.extend(level_records)
+        if relationship_agent and workspace.relationship_dirty_files():
+            _run_relationship_map_agent(
+                workspace,
+                relationship_agent,
+                workspace.relationship_dirty_files(),
+                run,
+                emit,
+                f"Refresh after specialist DAG level {level_index}.",
+            )
         summaries.append(f"Level {level_index}: {level_names}")
 
     return "Ran specialist DAG:\n" + "\n".join(f"- {item}" for item in summaries)
@@ -876,6 +1117,18 @@ def _workspace_tools(workspace: ProjectWorkspace) -> list[ToolFunction]:
         """Read a UTF-8 text file using a path relative to the project root, such as README.md or src/main.py."""
         return workspace.read_file(path)
 
+    def search_files(query: str, max_results: int = 8) -> str:
+        """Search project filenames and UTF-8 file contents, returning matching paths and short snippets."""
+        try:
+            limit = int(max_results)
+        except (TypeError, ValueError):
+            limit = 8
+        return json.dumps(workspace.search_files(query, limit), indent=2)
+
+    def relationship_graph() -> str:
+        """Recommended for existing-project work: read the current direct file relationship map before editing connected files."""
+        return workspace.relationship_graph()
+
     def write_file(path: str, content: str) -> str:
         """Create or replace a UTF-8 text file using a project-root-relative path, such as index.html or app.js."""
         written = workspace.write_file(path, content)
@@ -891,7 +1144,11 @@ def _workspace_tools(workspace: ProjectWorkspace) -> list[ToolFunction]:
         files = workspace.list_files()
         return json.dumps(files, indent=2)
 
-    return [read_file, write_file, append_file, list_files]
+    def show_changes() -> str:
+        """Show files created, modified, or deleted since this run started."""
+        return json.dumps(workspace.change_summary(), indent=2)
+
+    return [read_file, search_files, relationship_graph, write_file, append_file, list_files, show_changes]
 
 
 def _list_files_tool(workspace: ProjectWorkspace) -> ToolFunction:
@@ -900,6 +1157,14 @@ def _list_files_tool(workspace: ProjectWorkspace) -> ToolFunction:
         return json.dumps(workspace.list_files(), indent=2)
 
     return list_files
+
+
+def _relationship_graph_tool(workspace: ProjectWorkspace) -> ToolFunction:
+    def relationship_graph() -> str:
+        """Read the current direct file relationship map for the generated project workspace."""
+        return workspace.relationship_graph()
+
+    return relationship_graph
 
 
 def _specialist_tools(
@@ -962,7 +1227,8 @@ def _run_specialist_agent(
         timeout=SPECIALIST_TIMEOUT_SECONDS,
     )
     files = workspace.list_files()
-    specialist.output = _workspace_agent_summary(raw_output, files)
+    changes = workspace.change_summary()
+    specialist.output = _workspace_agent_summary(raw_output, files, changes)
     specialist_outputs.append(
         json.dumps(
             {
@@ -973,12 +1239,95 @@ def _run_specialist_agent(
                 "logic": specialist.logic,
                 "output": raw_output,
                 "files_after_agent": files,
+                "changes_after_agent": changes,
             },
             indent=2,
         )
     )
     _mark_done(None, specialist, emit)
     return specialist.output
+
+
+def _run_relationship_map_agent(
+    workspace: ProjectWorkspace,
+    relationship_agent: Agent,
+    selected_files: list[str],
+    run: Run | None,
+    emit: Emitter,
+    reason: str,
+) -> str:
+    files = sorted(set(selected_files))
+    if not workspace.reuse_existing:
+        return ""
+    _start_agent(relationship_agent, emit)
+    workspace.refresh_project_documents(files)
+    evidence = build_relationship_map_evidence(workspace.project_dir, files, workspace.list_files())
+    if evidence.files:
+        raw_output = _run_llama_agent(
+            relationship_agent.name,
+            _relationship_map_instructions(),
+            _relationship_map_input(workspace, evidence, reason),
+            max_tokens=2600,
+            timeout=PLANNER_TIMEOUT_SECONDS,
+        )
+        update = parse_relationship_map_response(
+            raw_output,
+            [item.path for item in evidence.files],
+            evidence.removed,
+        )
+    else:
+        update = RelationshipMapUpdate(entries={}, removed=evidence.removed)
+    context = workspace.apply_relationship_map_update(update, files)
+    output = (
+        f"{reason}\n"
+        f"Updated relationship entries for {len(files)} selected file(s): "
+        f"{', '.join(files) if files else 'none'}.\n\n"
+        f"{context}"
+    )
+    relationship_agent.input = json.dumps(files, indent=2)
+    relationship_agent.output = output
+    if run is not None:
+        run.relationship_summary = context
+    _mark_done(run, relationship_agent, emit)
+    return output
+
+
+def _relationship_map_instructions() -> str:
+    return (
+        "You are the Relationship Map Agent for an existing code project. "
+        "For each selected file, write one concise natural-language bullet that explains what the file does "
+        "and which local project files it directly loads, imports, or references. "
+        "Use the file content, filename, symbols, and direct-link evidence. "
+        "Mention only direct relationships, never transitive relationships. "
+        "Do not invent files or relationships that are not supported by the provided evidence/content. "
+        "Return only valid JSON, no markdown fences. Schema: "
+        '{"entries":[{"path":"workspace-relative path","summary":"- `path` does X and directly imports `other.py`.",'
+        '"direct_files":["other.py"]}]}. '
+        "Include exactly one entry for every selected file that still exists. "
+        "Use an empty direct_files list when the file does not directly load, import, or reference local project files."
+    )
+
+
+def _relationship_map_input(workspace: ProjectWorkspace, evidence: Any, reason: str) -> str:
+    file_blocks: list[str] = []
+    for item in evidence.files:
+        targets = ", ".join(item.direct_targets) or "none detected"
+        content = item.content or "[No readable text content.]"
+        file_blocks.append(
+            f"File: {item.path}\n"
+            f"Role hint: {item.role_hint}\n"
+            f"Direct relationship evidence: {item.deterministic_hint}\n"
+            f"Detected direct target files: {targets}\n"
+            f"Content excerpt:\n```\n{content}\n```"
+        )
+    removed = "\n".join(f"- {path}" for path in evidence.removed) or "- None"
+    return (
+        f"Refresh reason:\n{reason}\n\n"
+        f"Project folder:\n{workspace.project_dir}\n\n"
+        f"Removed selected files:\n{removed}\n\n"
+        "Selected files to update:\n\n"
+        + "\n\n---\n\n".join(file_blocks)
+    )
 
 
 def _agent_from_plan(agent: PlannedAgent) -> Agent:
@@ -1029,13 +1378,32 @@ def _emit_handoff(sender: Agent, recipient: Agent, content: str, emit: Emitter) 
     emit(message, sender)
 
 
-def _verification_report(project_dir: Path, written: list[str], verification: str) -> str:
+def _verification_report(project_dir: Path, written: list[str], verification: str, changes: dict[str, list[str]]) -> str:
     file_list = "\n".join(f"- {path}" for path in written)
-    return f"Created project folder: {project_dir}\n\nFiles:\n{file_list}\n\nVerification:\n{verification}"
+    changed = _format_changes(changes)
+    return f"Project folder: {project_dir}\n\nFiles:\n{file_list}\n\nChanged files:\n{changed}\n\nVerification:\n{verification}"
 
 
 def _verification_status(verification: str) -> str:
     return "passed" if "failed (" not in verification.lower() else "failed"
+
+
+def _change_status(changes: dict[str, list[str]]) -> str:
+    created = len(changes.get("created", []))
+    modified = len(changes.get("modified", []))
+    deleted = len(changes.get("deleted", []))
+    return f"{created} created, {modified} modified, {deleted} deleted"
+
+
+def _format_changes(changes: dict[str, list[str]]) -> str:
+    lines: list[str] = []
+    for label in ("created", "modified", "deleted"):
+        values = changes.get(label, [])
+        lines.append(f"{label.title()}:")
+        lines.extend(f"- {path}" for path in values)
+        if not values:
+            lines.append("- None")
+    return "\n".join(lines)
 
 
 def _plan_summary(plan: WorkflowPlan) -> str:
@@ -1099,13 +1467,53 @@ def _orchestrator_instructions() -> str:
         "Be specific about input format, expected output format, and logic for each agent. "
         "Set depends_on to only the specialist agent names that must complete before this agent can run. "
         "Use an empty depends_on list when an agent can run in parallel with other independent agents. "
+        "During the specialist phase, assign each writable source file to one primary agent only; if multiple agents need the same file, make one owner and put the others after that owner with depends_on for review, tests, or dependent changes. "
         "Assign at least one specialist that writes implementation files and at least one that owns verification, tests, or review artifacts. "
         "For web apps, include product/UX/frontend/backend/test roles as needed. "
         "For CLIs, include CLI/API/test/docs roles. For data tools, include schema/parser/analysis/test roles. "
         "For browser games, split gameplay logic, UI/rendering, styling, and quality/testing responsibilities. "
+        "For an existing selected project, plan incremental change agents that inspect current files, name likely affected files in their tasks, "
+        "use relationship_graph if available to understand direct file relationships, and avoid broad rewrites unless the user explicitly asks for them. "
         "Do not include Orchestrator, Project Builder, Verification Agent, or Review Agent in the agents list. "
         "Do not ask sub-orchestrators to create more sub-orchestrators; max hierarchy depth is 2."
     )
+
+
+def _orchestrator_input(
+    user_prompt: str,
+    selected_project: str = "",
+    repo_intake: RepoIntake | None = None,
+    code_index_context: str = "",
+) -> str:
+    if not selected_project:
+        project_context = "No existing project was selected. Plan a new generated project from scratch."
+    elif repo_intake is not None:
+        index_text = f"\n\nCode index summary:\n{code_index_context}" if code_index_context else ""
+        project_context = (
+            f"{repo_intake.to_prompt_context()}\n"
+            f"{index_text}\n"
+            "Plan changes against this existing project. Prefer incremental edits, identify affected files, "
+            "and preserve useful existing files."
+        )
+    else:
+        project_dir = ProjectWorkspace._existing_project_dir(selected_project)
+        files = sorted(
+            path.relative_to(project_dir).as_posix()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        )
+        visible_files = files[:120]
+        omitted = len(files) - len(visible_files)
+        file_tree = "\n".join(f"- {path}" for path in visible_files) or "- No files found."
+        if omitted > 0:
+            file_tree += f"\n- ... {omitted} more files omitted"
+        project_context = (
+            f"Existing project selected: {selected_project}\n"
+            f"Project folder: {project_dir}\n"
+            f"Current files:\n{file_tree}\n"
+            "Plan changes against this existing project. Prefer incremental edits and preserve useful existing files."
+        )
+    return f"User request:\n{user_prompt}\n\nProject mode:\n{project_context}"
 
 
 def _sub_orchestrator_instructions(sub_orchestrator: PlannedSubOrchestrator, plan: WorkflowPlan) -> str:
@@ -1124,6 +1532,8 @@ def _sub_orchestrator_instructions(sub_orchestrator: PlannedSubOrchestrator, pla
         '"depends_on":["Other specialist name"]}]}. '
         "Create 1 to 6 concrete specialist agents for your assigned domain only. "
         "Set depends_on to only the specialist names in this domain that must finish first; use [] for parallelizable work. "
+        "Within your domain, assign each writable source file to one primary specialist only; if multiple specialists need the same file, make one owner and sequence the others with depends_on for review, tests, or dependent changes. "
+        "For existing projects, use relationship_graph if available before assigning specialists to connected files. "
         "Do not create nested sub-orchestrators. Do not include Orchestrator, Project Builder, Verification Agent, or Review Agent."
     )
 
@@ -1189,6 +1599,8 @@ def _specialist_instructions(agent: Agent, plan: WorkflowPlan) -> str:
         f"Required logic: {agent.logic}. "
         f"Acceptance criteria: {criteria}. "
         "You have scoped project-file tools. Use them to read, write, append, and list files in the generated project workspace. "
+        "When continuing an existing project, use the provided project context, relationship_graph, list_files, search_files, and read_file before editing existing files; "
+        "keep unrelated code intact and make the smallest coherent change that satisfies your assigned task. "
         "Tool path rule: pass only paths relative to the workspace root, like index.html, app.js, src/main.py, or README.md. "
         "Never include generated_projects/, the project folder name, absolute paths, or parent-directory traversal in tool paths. "
         "Actually do your part of the coding by writing concrete source, test, style, markup, data, or documentation files. "
@@ -1226,6 +1638,8 @@ def _builder_instructions() -> str:
         "Rules: merge and normalize specialist work; include README.md; include tests or test notes when relevant; use only workspace-relative tool paths "
         "such as index.html, app.js, src/main.py, or README.md; do not include generated_projects/, the project folder name, absolute paths, "
         "or parent-directory traversal; and do not omit required source code. "
+        "When continuing an existing project, inspect the provided project context, relationship_graph, list_files, search_files, read_file, and show_changes before final edits; "
+        "preserve existing architecture and avoid wholesale rewrites. "
         "Honor the requested project type and stack. Prefer self-contained projects that can be verified without installs. "
         "For Python projects, prefer stdlib and unittest. For JavaScript projects, prefer Node built-ins. "
         "For browser apps and browser games, static HTML/CSS/JS is acceptable unless the user asks for a framework. "
@@ -1245,17 +1659,31 @@ def _builder_input(
         f"Workflow plan:\n{_plan_summary(plan)}\n\n"
         f"{_workspace_tool_context(workspace)}\n\n"
         f"Current files:\n{json.dumps(workspace.list_files(), indent=2)}\n\n"
+        f"Current run changes:\n{json.dumps(workspace.change_summary(), indent=2)}\n\n"
         f"Specialist structured outputs:\n{outputs}\n\n"
         "Inspect the current file tree, preserve useful specialist code and docs, resolve gaps, and finish the project files now."
     )
 
 
 def _workspace_tool_context(workspace: ProjectWorkspace) -> str:
+    mode = "existing-project update" if workspace.reuse_existing else "new-project generation"
+    brownfield = (
+        "This is an existing project. Use the project context, relationship_graph, list_files, search_files, and read_file to understand current files. "
+        "Always read_file before modifying existing files, and use show_changes to review your edits."
+        if workspace.reuse_existing
+        else "This is a new project workspace."
+    )
+    intake = f"Repository intake summary:\n{workspace.repo_intake_context}\n" if workspace.repo_intake_context else ""
+    code_index = f"Code index summary:\n{workspace.code_index_context}\n" if workspace.code_index_context else ""
     return (
         f"Generated project workspace on disk: {workspace.project_dir}\n"
+        f"Project mode: {mode}\n"
+        f"{intake}"
+        f"{code_index}"
         "File tools are already scoped to this folder. Tool path arguments must be relative to the workspace root, "
         "for example index.html, app.js, src/main.py, tests/test_app.py, or README.md. "
-        "Do not prefix tool paths with generated_projects/ or the project folder name."
+        "Do not prefix tool paths with generated_projects/ or the project folder name. "
+        f"{brownfield}"
     )
 
 
@@ -1282,15 +1710,16 @@ def _specialist_output_summary(agent: Agent, result: SpecialistResult) -> str:
     )
 
 
-def _workspace_agent_summary(output: str, files: list[str]) -> str:
+def _workspace_agent_summary(output: str, files: list[str], changes: dict[str, list[str]] | None = None) -> str:
     file_list = "\n".join(f"- {path}" for path in files) or "- No files written yet."
-    return f"{output}\n\nWorkspace files after this agent:\n{file_list}"
+    change_text = f"\n\nChanges after this agent:\n{_format_changes(changes)}" if changes is not None else ""
+    return f"{output}\n\nWorkspace files after this agent:\n{file_list}{change_text}"
 
 
 def _reviewer_instructions() -> str:
     return (
-        "You are the review agent. Review the generated project from the artifact list and verification output. "
-        "State what was created, whether verification passed, and the top issues or next steps. "
+        "You are the review agent. Review the generated or updated project from the artifact list, changed-file summary, and verification output. "
+        "State what changed, whether verification passed, and the top issues or next steps. "
         "Be concise and do not claim manual inspection beyond the provided evidence."
     )
 

@@ -8,10 +8,13 @@ from pathlib import Path
 from threading import Event, Lock
 from unittest.mock import patch
 
+from app.code_index import build_project_code_index, refresh_project_code_index_files
 from app.frameworks import current_framework_profile
 from app.models import Run
 from app.orchestrator import design_workflow, manual_agent_message, run_workflow
+from app.project_registry import delete_project, list_projects, rename_project
 from app.project_runtime import ProjectRuntimeError, ProjectWorkspace
+from app.relationship_map import build_relationship_map_update, relationship_map_context
 
 
 def fake_model(system_prompt: str, user_prompt: str) -> str:
@@ -68,6 +71,61 @@ def _run_all_specialist_tools(tools: list) -> None:
             tool(f"Complete {tool.__name__} and write real project files.")
 
 
+def _fake_relationship_map_response(input_text: str) -> str:
+    paths = [line.removeprefix("File: ").strip() for line in input_text.splitlines() if line.startswith("File: ")]
+    entries: list[dict[str, object]] = []
+    for path in paths:
+        if path == "index.html":
+            entries.append(
+                {
+                    "path": path,
+                    "summary": "- `index.html` is the browser page shell and directly loads `app.js`.",
+                    "direct_files": ["app.js"],
+                }
+            )
+        elif path == "app.js":
+            entries.append(
+                {
+                    "path": path,
+                    "summary": "- `app.js` owns browser behavior and does not directly load local project files.",
+                    "direct_files": [],
+                }
+            )
+        elif path == "style.css":
+            entries.append(
+                {
+                    "path": path,
+                    "summary": "- `style.css` owns visual styling and does not directly load local project files.",
+                    "direct_files": [],
+                }
+            )
+        elif path == "TESTING.md":
+            entries.append(
+                {
+                    "path": path,
+                    "summary": "- `TESTING.md` documents verification checks and does not directly load local project files.",
+                    "direct_files": [],
+                }
+            )
+        elif path.endswith(".py"):
+            entries.append(
+                {
+                    "path": path,
+                    "summary": f"- `{path}` defines or tests Python behavior and does not directly load local project files.",
+                    "direct_files": [],
+                }
+            )
+        else:
+            entries.append(
+                {
+                    "path": path,
+                    "summary": f"- `{path}` describes or supports the project and does not directly load local project files.",
+                    "direct_files": [],
+                }
+            )
+    return json.dumps({"entries": entries})
+
+
 def fake_tiny_llama_agent(
     name: str,
     instructions: str,
@@ -76,6 +134,8 @@ def fake_tiny_llama_agent(
     tools: list | None = None,
     timeout: int = 120,
 ) -> str:
+    if name == "Relationship Map Agent":
+        return _fake_relationship_map_response(input_text)
     if name == "Orchestrator":
         return json.dumps(
             {
@@ -146,6 +206,78 @@ def fake_tiny_llama_agent(
         return "Inspected and completed the tiny Python project."
     if name == "Review Agent":
         return "Generated files were reviewed and static verification passed."
+    return f"{name} output"
+
+
+def fake_brownfield_llama_agent(
+    name: str,
+    instructions: str,
+    input_text: str,
+    max_tokens: int,
+    tools: list | None = None,
+    timeout: int = 120,
+) -> str:
+    if name == "Relationship Map Agent":
+        return _fake_relationship_map_response(input_text)
+    if name == "Orchestrator":
+        return json.dumps(
+            {
+                "project_name": "existing-app",
+                "project_summary": "Incrementally update an existing browser app.",
+                "complexity": "medium",
+                "estimated_files": 3,
+                "acceptance_criteria": ["Preserve current app files", "Add the requested status behavior"],
+                "agents": [
+                    {
+                        "name": "Brownfield Feature Engineer",
+                        "purpose": "Modify the existing frontend behavior.",
+                        "task": "Find the current browser app entrypoint, preserve existing behavior, and add a status message.",
+                        "input": "Repo intake summary and user request.",
+                        "input_format": "Existing-project repo map plus request.",
+                        "expected_output_format": "Small edit to existing app.js.",
+                        "logic": "Search for the entrypoint, read it, then rewrite only the needed file.",
+                        "deliverable": "Updated app.js.",
+                    },
+                    {
+                        "name": "Brownfield QA Engineer",
+                        "purpose": "Document verification for the existing app change.",
+                        "task": "Create test notes for the modified status behavior.",
+                        "input": "Feature Engineer output.",
+                        "input_format": "Changed files and acceptance criteria.",
+                        "expected_output_format": "TESTING.md notes.",
+                        "logic": "Document manual browser checks without deleting existing docs.",
+                        "deliverable": "TESTING.md.",
+                        "depends_on": ["Brownfield Feature Engineer"],
+                    },
+                ],
+            }
+        )
+    if name == "Brownfield Feature Engineer":
+        relationships = _call_tool(tools or [], "relationship_graph")
+        files = _call_tool(tools or [], "list_files")
+        search_results = _call_tool(tools or [], "search_files", "boot", "5")
+        current = _call_tool(tools or [], "read_file", "app.js")
+        assert "boot" in current
+        assert "index.html" in relationships
+        assert "app.js" in relationships
+        assert "app.js" in files
+        assert "app.js" in search_results
+        _call_tool(
+            tools or [],
+            "write_file",
+            "app.js",
+            "function boot() {\n  return 'ready';\n}\n\nfunction statusMessage() {\n  return 'Updated existing app';\n}\n",
+        )
+        return "Inspected and updated app.js without replacing unrelated files."
+    if name == "Brownfield QA Engineer":
+        _call_tool(tools or [], "write_file", "TESTING.md", "# Testing\n\n- Open index.html and confirm the status message.\n")
+        return "Added brownfield verification notes."
+    if name == "Project Builder":
+        changes = _call_tool(tools or [], "show_changes")
+        assert "app.js" in changes
+        return "Reviewed changed files and left the existing project structure intact."
+    if name == "Review Agent":
+        return "Existing project update was reviewed with changed-file evidence."
     return f"{name} output"
 
 
@@ -505,6 +637,7 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertIn("Requirements Analyst", [agent.name for agent in run.agents])
                 self.assertIn("Python Engineer", [agent.name for agent in run.agents])
                 self.assertIn("Test Engineer", [agent.name for agent in run.agents])
+                self.assertNotIn("Relationship Map Agent", [agent.name for agent in run.agents])
                 python_engineer = next(agent for agent in run.agents if agent.name == "Python Engineer")
                 self.assertIn("Workflow plan", python_engineer.input_format)
                 self.assertIn("Python source", python_engineer.expected_output_format)
@@ -514,6 +647,98 @@ class OrchestratorTests(unittest.TestCase):
                 verification_agent = next(agent for agent in run.agents if agent.name == "Verification Agent")
                 self.assertIn("unittest", verification_agent.output)
                 self.assertIn("Verification: passed", run.summary)
+
+    def test_existing_project_run_reuses_selected_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("app.project_runtime.GENERATED_ROOT", Path(temp_dir)):
+                existing = Path(temp_dir) / "existing-app"
+                existing.mkdir()
+                (existing / "keep.txt").write_text("preserve me\n", encoding="utf-8")
+                captured: dict[str, str] = {}
+
+                def fake_agent(
+                    name: str,
+                    instructions: str,
+                    input_text: str,
+                    max_tokens: int,
+                    tools: list | None = None,
+                    timeout: int = 120,
+                ) -> str:
+                    if name == "Relationship Map Agent":
+                        return _fake_relationship_map_response(input_text)
+                    if name == "Orchestrator":
+                        captured["orchestrator_input"] = input_text
+                        captured["orchestrator_tools"] = ",".join(getattr(tool, "__name__", "") for tool in tools or [])
+                    return fake_tiny_llama_agent(name, instructions, input_text, max_tokens, tools, timeout)
+
+                with patch("app.project_runtime._run_llama_agent", fake_agent):
+                    run = Run(prompt="Continue this project with a tiny tool", selected_project="existing-app")
+                    run_workflow(run, delay=0)
+
+                self.assertEqual(run.status, "complete")
+                self.assertEqual(Path(run.project_path), existing)
+                self.assertEqual(run.project_mode, "existing")
+                self.assertTrue((existing / "keep.txt").exists())
+                self.assertTrue((existing / "README.md").exists())
+                self.assertFalse((Path(temp_dir) / "tiny-tool").exists())
+                intake = next(agent for agent in run.agents if agent.name == "Repository Intake Agent")
+                self.assertEqual(intake.status, "done")
+                self.assertIn("keep.txt", intake.output)
+                self.assertIn("keep.txt", run.repo_summary)
+                index_agent = next(agent for agent in run.agents if agent.name == "Code Index Agent")
+                self.assertEqual(index_agent.status, "done")
+                self.assertIn("Code index", index_agent.output)
+                relationship_agent = next(agent for agent in run.agents if agent.name == "Relationship Map Agent")
+                self.assertEqual(relationship_agent.status, "done")
+                self.assertIn("Project relationship map", relationship_agent.output)
+                self.assertIn("keep.txt", run.relationship_summary)
+                self.assertNotIn("Project relationship map", captured["orchestrator_input"])
+                self.assertIn("relationship_graph", captured["orchestrator_tools"])
+                self.assertIn("Existing project selected: existing-app", captured["orchestrator_input"])
+
+    def test_brownfield_run_searches_existing_project_and_reports_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("app.project_runtime.GENERATED_ROOT", Path(temp_dir)):
+                existing = Path(temp_dir) / "existing-app"
+                existing.mkdir()
+                (existing / "README.md").write_text("# Existing App\n\nKeep this doc.\n", encoding="utf-8")
+                (existing / "index.html").write_text("<!doctype html><script src=\"app.js\"></script>\n", encoding="utf-8")
+                (existing / "app.js").write_text("function boot() {\n  return 'boot';\n}\n", encoding="utf-8")
+                (existing / "package.json").write_text(
+                    json.dumps({"scripts": {"test": "node --test", "build": "echo build"}}),
+                    encoding="utf-8",
+                )
+
+                with patch("app.project_runtime._run_llama_agent", fake_brownfield_llama_agent):
+                    run = Run(prompt="Add a status message to the existing app", selected_project="existing-app")
+                    run_workflow(run, delay=0)
+
+                self.assertEqual(run.status, "complete")
+                self.assertEqual(Path(run.project_path), existing)
+                self.assertIn("Updated existing app", (existing / "app.js").read_text(encoding="utf-8"))
+                self.assertIn("Keep this doc", (existing / "README.md").read_text(encoding="utf-8"))
+                self.assertEqual(run.modified_files["modified"], ["app.js"])
+                self.assertEqual(run.modified_files["created"], ["TESTING.md"])
+                self.assertEqual(run.modified_files["deleted"], [])
+                self.assertIn("npm test", run.repo_summary)
+                self.assertIn("function boot", run.code_index_summary)
+                self.assertIn("index.html", run.relationship_summary)
+                self.assertIn("directly loads `app.js`", run.relationship_summary)
+                self.assertIn("TESTING.md", run.relationship_summary)
+                self.assertTrue(any(agent.name == "Code Index Agent" for agent in run.agents))
+                relationship_agent = next(agent for agent in run.agents if agent.name == "Relationship Map Agent")
+                self.assertIn("Updated relationship entries for 1 selected file(s): TESTING.md", relationship_agent.output)
+                relationship_messages = [
+                    message.content
+                    for message in run.transcript
+                    if message.sender == "Relationship Map Agent" and "Updated relationship entries" in message.content
+                ]
+                self.assertTrue(any("Initial relationship map" in message for message in relationship_messages))
+                self.assertTrue(any("Refresh after specialist DAG level 1" in message and "app.js" in message for message in relationship_messages))
+                self.assertTrue(any("Refresh after specialist DAG level 2" in message and "TESTING.md" in message for message in relationship_messages))
+                self.assertIn("Updated existing project", run.summary)
+                verifier = next(agent for agent in run.agents if agent.name == "Verification Agent")
+                self.assertIn("Modified:", verifier.output)
 
     def test_browser_tic_tac_toe_workflow_creates_executable_game(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -729,6 +954,76 @@ class OrchestratorTests(unittest.TestCase):
                 for path in ["../escape.txt", "/absolute.txt", "C:/absolute.txt", "docs/../escape.txt"]:
                     with self.assertRaises(ProjectRuntimeError):
                         workspace.write_file(path, "bad")
+
+    def test_project_registry_lists_renames_and_deletes_generated_projects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("app.project_runtime.GENERATED_ROOT", Path(temp_dir)):
+                project = Path(temp_dir) / "alpha-app"
+                project.mkdir()
+                (project / "README.md").write_text("# Alpha\n", encoding="utf-8")
+
+                projects = list_projects()
+                self.assertEqual([item["name"] for item in projects], ["alpha-app"])
+                self.assertEqual(projects[0]["file_count"], 1)
+
+                renamed = rename_project("alpha-app", "Beta App")
+                self.assertEqual(renamed["name"], "beta-app")
+                self.assertFalse(project.exists())
+                self.assertTrue((Path(temp_dir) / "beta-app").exists())
+
+                delete_project("beta-app")
+                self.assertEqual(list_projects(), [])
+
+    def test_code_index_builds_documents_and_symbol_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = Path(temp_dir)
+            (project / "app.js").write_text(
+                "import './style.css';\n"
+                "function boot() {\n  return statusMessage();\n}\n\n"
+                "const statusMessage = () => 'ready';\n",
+                encoding="utf-8",
+            )
+            (project / "index.html").write_text("<main id=\"status\"></main>\n", encoding="utf-8")
+
+            index = build_project_code_index(project)
+
+            self.assertEqual(len(index.documents), 2)
+            self.assertIn("Code index", index.to_prompt_context())
+            self.assertIn("boot", index.to_prompt_context())
+            self.assertIn("app.js", index.entries)
+            self.assertEqual(index.entries["app.js"].symbols[0].name, "boot")
+            self.assertEqual(index.documents[0].metadata["path"], "app.js")
+
+            (project / "app.js").write_text(
+                "import './style.css';\n"
+                "function boot() {\n  return nextStatus();\n}\n\n"
+                "function nextStatus() {\n  return 'updated';\n}\n",
+                encoding="utf-8",
+            )
+            refresh_project_code_index_files(index, ["app.js"])
+            self.assertIn("nextStatus", index.to_prompt_context())
+            self.assertIn("nextStatus", index.file_documents["app.js"].text)
+
+    def test_relationship_map_describes_direct_file_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = Path(temp_dir)
+            (project / "index.html").write_text(
+                "<!doctype html><link rel=\"stylesheet\" href=\"style.css\"><script src=\"app.js\"></script>\n",
+                encoding="utf-8",
+            )
+            (project / "app.js").write_text("import './utils.js';\nconsole.log('ok');\n", encoding="utf-8")
+            (project / "utils.js").write_text("export const ok = true;\n", encoding="utf-8")
+            (project / "style.css").write_text("body { margin: 0; }\n", encoding="utf-8")
+
+            all_files = ["app.js", "index.html", "style.css", "utils.js"]
+            update = build_relationship_map_update(project, all_files, all_files)
+            summaries = {path: entry.summary for path, entry in update.entries.items()}
+            context = relationship_map_context(summaries)
+
+            self.assertIn("`index.html` is a browser page shell", context)
+            self.assertIn("directly loads `app.js` and `style.css`", context)
+            self.assertIn("`app.js` owns JavaScript behavior and directly imports `utils.js`", context)
+            self.assertIn("does not directly load local project files", summaries["utils.js"])
 
     def test_design_workflow_adds_relevant_agents(self) -> None:
         agents = design_workflow("Build a web UI with an MCP backend for coding agents")

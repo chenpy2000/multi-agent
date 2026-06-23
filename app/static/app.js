@@ -1,6 +1,8 @@
 const state = {
   currentRun: null,
   pollTimer: null,
+  projects: [],
+  selectedProject: "",
 };
 
 const els = {
@@ -12,6 +14,8 @@ const els = {
   runStatus: document.querySelector("#runStatus"),
   runSubtitle: document.querySelector("#runSubtitle"),
   runList: document.querySelector("#runList"),
+  projectList: document.querySelector("#projectList"),
+  newProject: document.querySelector("#newProjectButton"),
   agentGrid: document.querySelector("#agentGrid"),
   nudge: document.querySelector("#nudgeButton"),
   frameworkBadge: document.querySelector("#frameworkBadge"),
@@ -35,7 +39,10 @@ els.form.addEventListener("submit", async (event) => {
   const response = await fetch("/api/runs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify({
+      prompt,
+      selected_project: state.selectedProject || "",
+    }),
   });
   const run = await response.json();
   if (!response.ok) {
@@ -53,6 +60,12 @@ els.input.addEventListener("keydown", (event) => {
     event.preventDefault();
     els.form.requestSubmit();
   }
+});
+
+els.newProject.addEventListener("click", () => {
+  state.selectedProject = "";
+  renderProjects(state.projects);
+  renderProjectMode();
 });
 
 els.nudge.addEventListener("click", async () => {
@@ -96,6 +109,7 @@ function startPolling(runId) {
     if (run && ["complete", "failed"].includes(run.status)) {
       window.clearInterval(state.pollTimer);
       els.send.disabled = false;
+      await loadProjects();
     }
   }, 700);
 }
@@ -115,7 +129,7 @@ function setCurrentRun(run) {
 }
 
 function renderRun(run) {
-  els.runSubtitle.textContent = run.prompt;
+  renderProjectMode(run);
   els.runStatus.textContent = titleCase(run.status);
   els.runStatus.className = `status-badge ${run.status}`;
   els.frameworkBadge.textContent = `${titleCase(run.framework || "llamaindex")} runtime`;
@@ -124,6 +138,101 @@ function renderRun(run) {
   renderWorkflow(run.agents || []);
   renderChat(run);
   renderAgents(run.agents || []);
+}
+
+async function loadProjects() {
+  const response = await fetch("/api/projects");
+  if (!response.ok) return;
+  state.projects = await response.json();
+  if (state.selectedProject && !state.projects.some((project) => project.name === state.selectedProject)) {
+    state.selectedProject = "";
+  }
+  renderProjects(state.projects);
+  renderProjectMode(state.currentRun);
+}
+
+function renderProjects(projects) {
+  els.projectList.innerHTML = "";
+  const newButton = document.createElement("button");
+  newButton.className = `project-item ${state.selectedProject ? "" : "is-active"}`;
+  newButton.type = "button";
+  newButton.innerHTML = `<strong>New project</strong><span>Generate from scratch</span>`;
+  newButton.addEventListener("click", () => {
+    state.selectedProject = "";
+    renderProjects(state.projects);
+    renderProjectMode(state.currentRun);
+  });
+  els.projectList.appendChild(newButton);
+
+  if (!projects.length) return;
+
+  projects.forEach((project) => {
+    const item = document.createElement("div");
+    item.className = `project-item ${state.selectedProject === project.name ? "is-active" : ""}`;
+    item.innerHTML = `
+      <button class="project-select" type="button">
+        <strong>${escapeHtml(project.name)}</strong>
+        <span>${escapeHtml(project.file_count)} files</span>
+      </button>
+      <div class="project-actions">
+        <button class="icon-button" type="button" title="Rename project" aria-label="Rename ${escapeHtml(project.name)}">&#9998;</button>
+        <button class="icon-button danger" type="button" title="Delete project" aria-label="Delete ${escapeHtml(project.name)}">&#128465;</button>
+      </div>
+    `;
+    item.querySelector(".project-select").addEventListener("click", () => {
+      state.selectedProject = project.name;
+      renderProjects(state.projects);
+      renderProjectMode(state.currentRun);
+    });
+    item.querySelector(".project-actions .icon-button").addEventListener("click", () => renameProject(project.name));
+    item.querySelector(".project-actions .danger").addEventListener("click", () => deleteProject(project.name));
+    els.projectList.appendChild(item);
+  });
+}
+
+async function renameProject(projectName) {
+  const nextName = window.prompt("Rename project", projectName);
+  if (!nextName || nextName.trim() === projectName) return;
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectName)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: nextName.trim() }),
+  });
+  if (!response.ok) {
+    const payload = await response.json();
+    appendSystemMessage(payload.error || "The project could not be renamed.");
+    return;
+  }
+  const renamed = await response.json();
+  if (state.selectedProject === projectName) state.selectedProject = renamed.name;
+  await loadProjects();
+}
+
+async function deleteProject(projectName) {
+  if (!window.confirm(`Delete ${projectName}?`)) return;
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectName)}`, { method: "DELETE" });
+  if (!response.ok) {
+    const payload = await response.json();
+    appendSystemMessage(payload.error || "The project could not be deleted.");
+    return;
+  }
+  if (state.selectedProject === projectName) state.selectedProject = "";
+  await loadProjects();
+}
+
+function renderProjectMode(run = null) {
+  if (run) {
+    const suffix = run.selected_project
+      ? ` · Continued ${run.selected_project}`
+      : state.selectedProject
+        ? ` · Next: continue ${state.selectedProject}`
+        : "";
+    els.runSubtitle.textContent = `${run.prompt}${suffix}`;
+  } else if (state.selectedProject) {
+    els.runSubtitle.textContent = `Next request will continue ${state.selectedProject}`;
+  } else {
+    els.runSubtitle.textContent = "Describe a coding task and watch the workflow form.";
+  }
 }
 
 function renderRunList(runs) {
@@ -212,11 +321,13 @@ function renderChat(run) {
     const artifacts = (run.artifacts || []).map((artifact) => `
       <li><strong>${escapeHtml(artifact.name)}</strong><span>${escapeHtml(artifact.description)}</span></li>
     `).join("");
+    const changes = renderChanges(run.modified_files || {});
     article.innerHTML = `
       <div class="avatar">F</div>
       <div class="bubble">
         <strong>Generated Project</strong>
         <p>${escapeHtml(run.project_path || "Files were generated.")}</p>
+        ${changes}
         ${artifacts ? `<ul class="artifact-list">${artifacts}</ul>` : ""}
       </div>
     `;
@@ -263,6 +374,16 @@ function renderAgents(agents) {
     `;
     els.agentGrid.appendChild(card);
   });
+}
+
+function renderChanges(changes) {
+  const groups = ["created", "modified", "deleted"].map((key) => {
+    const files = Array.isArray(changes[key]) ? changes[key] : [];
+    if (!files.length) return "";
+    const items = files.map((path) => `<li>${escapeHtml(path)}</li>`).join("");
+    return `<div class="change-group"><strong>${titleCase(key)}</strong><ul>${items}</ul></div>`;
+  }).join("");
+  return groups ? `<div class="change-list">${groups}</div>` : "";
 }
 
 function appendUserMessage(content, scroll = true) {
@@ -318,4 +439,5 @@ async function loadFramework() {
 }
 
 loadFramework();
+loadProjects();
 loadRuns();

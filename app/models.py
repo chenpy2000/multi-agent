@@ -61,6 +61,12 @@ class Run:
     framework: str = "llamaindex"
     framework_note: str = ""
     project_path: str = ""
+    selected_project: str = ""
+    project_mode: str = "new"
+    repo_summary: str = ""
+    code_index_summary: str = ""
+    relationship_summary: str = ""
+    modified_files: dict[str, list[str]] = field(default_factory=dict)
     agents: list[Agent] = field(default_factory=list)
     transcript: list[Message] = field(default_factory=list)
     artifacts: list[dict[str, str]] = field(default_factory=list)
