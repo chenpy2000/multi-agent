@@ -330,38 +330,19 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
     specialist_outputs: list[str] = []
     early_execution_summary = ""
     if sub_orchestrator_agents and specialist_agents:
-        parallel_emit_lock = Lock()
-
-        def parallel_emit(message: Message, agent: Agent | None = None) -> None:
-            with parallel_emit_lock:
-                emit(message, agent)
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            sub_future = executor.submit(
-                _run_sub_orchestrator_dag,
-                run.prompt,
-                plan,
-                sub_orchestrator_agents,
-                workspace,
-                orchestrator,
-                parallel_emit,
-                used_specialist_names,
-            )
-            specialist_future = executor.submit(
-                _run_specialist_dag,
-                run.prompt,
-                plan,
-                specialist_agents,
-                specialist_outputs,
-                workspace,
-                orchestrator,
-                parallel_emit,
-                relationship_agent,
-                run,
-                1,
-            )
-            planned_sub_orchestrator_results = sub_future.result()
-            early_execution_summary = specialist_future.result()
+        planned_sub_orchestrator_results, early_execution_summary = _run_initial_agent_dag(
+            run.prompt,
+            plan,
+            sub_orchestrator_agents,
+            specialist_agents,
+            specialist_outputs,
+            workspace,
+            orchestrator,
+            emit,
+            used_specialist_names,
+            relationship_agent,
+            run,
+        )
     else:
         planned_sub_orchestrator_results = _run_sub_orchestrator_dag(
             run.prompt,
@@ -390,7 +371,10 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
         sub_orchestrator_specialists.extend(new_specialists)
         used_specialist_names.update(agent.name.lower() for agent in new_specialists)
         sub_orchestrator.output = _sub_orchestrator_summary(planned_sub_orchestrator, planned_specialists)
-        _mark_done(run, sub_orchestrator, emit)
+        if sub_orchestrator.status == "done":
+            emit(Message(sender=sub_orchestrator.name, recipient="all", kind="agent", content=sub_orchestrator.output), sub_orchestrator)
+        else:
+            _mark_done(run, sub_orchestrator, emit)
 
     builder.depends_on = [agent.name for agent in specialist_agents] or [agent.name for agent in sub_orchestrator_agents] or ["Orchestrator"]
     run.agents = [*intake_agents, orchestrator, *sub_orchestrator_agents, *specialist_agents, builder, verifier, reviewer]
@@ -403,7 +387,7 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
             content="Assigned dynamic agents: " + ", ".join(agent.name for agent in specialist_agents),
         )
     )
-    remaining_specialists = [agent for agent in specialist_agents if agent.status != "done"] if early_execution_summary else specialist_agents
+    remaining_specialists = sub_orchestrator_specialists if early_execution_summary else specialist_agents
     later_execution_summary = _run_specialist_dag(
         run.prompt,
         plan,
@@ -513,7 +497,8 @@ def parse_workflow_plan(text: str, prompt: str) -> WorkflowPlan:
 
     used_names = {"orchestrator", "project builder", "verification agent", "review agent", "relationship map agent"}
     sub_orchestrators = _parse_sub_orchestrators(raw_sub_orchestrators, used_names)
-    planned = _parse_planned_agents(raw_agents, "Orchestrator", used_names)
+    dependency_aliases = {agent.name.lower(): agent.name for agent in sub_orchestrators}
+    planned = _parse_planned_agents(raw_agents, "Orchestrator", used_names, dependency_aliases)
 
     return WorkflowPlan(
         project_name=_slugify(project_name) or "generated-project",
@@ -543,8 +528,13 @@ def parse_sub_orchestrator_plan(
     return _parse_planned_agents(raw_agents, sub_orchestrator_name, used_names)
 
 
-def _parse_planned_agents(raw_agents: list[object], label: str, used_names: set[str]) -> list[PlannedAgent]:
-    name_map: dict[str, str] = {}
+def _parse_planned_agents(
+    raw_agents: list[object],
+    label: str,
+    used_names: set[str],
+    dependency_aliases: dict[str, str] | None = None,
+) -> list[PlannedAgent]:
+    name_map: dict[str, str] = dict(dependency_aliases or {})
     unique_names: list[str] = []
     for index, raw_agent in enumerate(raw_agents, start=1):
         if not isinstance(raw_agent, dict):
@@ -1054,6 +1044,116 @@ def _run_sub_orchestrator_dag(
     return planned_results
 
 
+def _run_initial_agent_dag(
+    user_prompt: str,
+    plan: WorkflowPlan,
+    sub_orchestrator_agents: list[Agent],
+    specialist_agents: list[Agent],
+    specialist_outputs: list[str],
+    workspace: ProjectWorkspace,
+    orchestrator: Agent,
+    emit: Emitter,
+    used_names: set[str],
+    relationship_agent: Agent | None = None,
+    run: Run | None = None,
+) -> tuple[list[tuple[PlannedSubOrchestrator, Agent, list[PlannedAgent]]], str]:
+    initial_agents = [*sub_orchestrator_agents, *specialist_agents]
+    if not initial_agents:
+        return [], "No initial agents were required."
+
+    levels = _agent_execution_levels(initial_agents)
+    sub_by_name = {
+        agent.name: (planned_sub_orchestrator, agent)
+        for planned_sub_orchestrator, agent in zip(plan.sub_orchestrators, sub_orchestrator_agents)
+    }
+    agent_by_name = {agent.name: agent for agent in initial_agents}
+    raw_sub_outputs: dict[str, str] = {}
+    emit_lock = Lock()
+
+    def thread_safe_emit(message: Message, agent: Agent | None = None) -> None:
+        with emit_lock:
+            emit(message, agent)
+
+    summaries: list[str] = []
+    for level_index, level in enumerate(levels, start=1):
+        level_names = ", ".join(agent.name for agent in level)
+        emit(
+            Message(
+                sender="Orchestrator",
+                recipient="all",
+                kind="system",
+                content=f"Running initial DAG level {level_index} in parallel: {level_names}",
+            )
+        )
+        outputs_before_level = list(specialist_outputs)
+
+        def run_one(agent: Agent) -> tuple[str, str, str, list[str]]:
+            if agent.name in sub_by_name:
+                planned_sub_orchestrator, sub_orchestrator = sub_by_name[agent.name]
+                _emit_handoff(
+                    orchestrator,
+                    sub_orchestrator,
+                    f"Plan specialists for domain: {planned_sub_orchestrator.domain}",
+                    thread_safe_emit,
+                )
+                _start_agent(sub_orchestrator, thread_safe_emit)
+                raw_output = _run_planner_llama_agent(
+                    sub_orchestrator.name,
+                    _sub_orchestrator_instructions(planned_sub_orchestrator, plan),
+                    _sub_orchestrator_input(user_prompt, plan, planned_sub_orchestrator, workspace),
+                    2400,
+                    [_relationship_graph_tool(workspace)] if workspace.reuse_existing else None,
+                    SUB_ORCHESTRATOR_TIMEOUT_SECONDS,
+                )
+                sub_orchestrator.output = "Specialist plan generated."
+                _mark_done(run, sub_orchestrator, thread_safe_emit)
+                return "sub_orchestrator", agent.name, raw_output, []
+
+            local_outputs = list(outputs_before_level)
+            before_count = len(local_outputs)
+            sender = _dependency_sender(agent, agent_by_name, orchestrator)
+            _run_specialist_agent(user_prompt, plan, agent, local_outputs, workspace, sender, thread_safe_emit)
+            return "specialist", agent.name, "", local_outputs[before_count:]
+
+        with ThreadPoolExecutor(max_workers=len(level)) as executor:
+            futures = {executor.submit(run_one, agent): agent for agent in level}
+            level_records: list[str] = []
+            for future in as_completed(futures):
+                agent = futures[future]
+                try:
+                    kind, name, raw_output, records = future.result()
+                except Exception:
+                    agent.status = "failed"
+                    agent.finished_at = now_iso()
+                    raise
+                if kind == "sub_orchestrator":
+                    raw_sub_outputs[name] = raw_output
+                else:
+                    level_records.extend(records)
+            specialist_outputs.extend(level_records)
+
+        if relationship_agent and workspace.relationship_dirty_files():
+            _run_relationship_map_agent(
+                workspace,
+                relationship_agent,
+                workspace.relationship_dirty_files(),
+                run,
+                emit,
+                f"Refresh after initial DAG level {level_index}.",
+            )
+        summaries.append(f"Level {level_index}: {level_names}")
+
+    planned_results: list[tuple[PlannedSubOrchestrator, Agent, list[PlannedAgent]]] = []
+    for planned_sub_orchestrator, sub_orchestrator in zip(plan.sub_orchestrators, sub_orchestrator_agents):
+        planned_specialists = parse_sub_orchestrator_plan(
+            raw_sub_outputs[sub_orchestrator.name],
+            planned_sub_orchestrator.name,
+            used_names,
+        )
+        planned_results.append((planned_sub_orchestrator, sub_orchestrator, planned_specialists))
+    return planned_results, "Ran initial DAG:\n" + "\n".join(f"- {item}" for item in summaries)
+
+
 def _run_specialist_dag(
     user_prompt: str,
     plan: WorkflowPlan,
@@ -1064,7 +1164,6 @@ def _run_specialist_dag(
     emit: Emitter,
     relationship_agent: Agent | None = None,
     run: Run | None = None,
-    max_levels: int | None = None,
 ) -> str:
     if not specialist_agents:
         return "No specialist agents were required."
@@ -1079,8 +1178,6 @@ def _run_specialist_dag(
 
     summaries: list[str] = []
     for level_index, level in enumerate(levels, start=1):
-        if max_levels is not None and level_index > max_levels:
-            break
         level_names = ", ".join(agent.name for agent in level)
         emit(
             Message(
@@ -1127,7 +1224,7 @@ def _run_specialist_dag(
 
 def _combine_execution_summaries(early_summary: str, later_summary: str) -> str:
     if early_summary and later_summary and later_summary != "No specialist agents were required.":
-        return f"Root direct specialists:\n{early_summary}\n\nSub-orchestrator specialists:\n{later_summary}"
+        return f"Initial DAG:\n{early_summary}\n\nSub-orchestrator specialists:\n{later_summary}"
     if early_summary:
         return early_summary
     return later_summary
@@ -1537,7 +1634,9 @@ def _orchestrator_instructions() -> str:
         "When using sub-orchestrators, direct agents may be empty or limited to cross-cutting specialists. "
         "Every specialist must have a concrete coding, test, UI, data, or documentation subtask. "
         "Be specific about input format, expected output format, and logic for each agent. "
-        "Set depends_on to only the specialist agent names that must complete before this agent can run. "
+        "The scheduler strictly follows depends_on as a DAG and does not add hidden phase barriers. "
+        "Set depends_on to only the direct specialist or sub-orchestrator names that must complete before this agent can run. "
+        "If a direct specialist must wait for a sub-orchestrator to finish planning, include that sub-orchestrator's exact name in depends_on. "
         "Use an empty depends_on list when an agent can run in parallel with other independent agents. "
         "During the specialist phase, assign each writable source file to one primary agent only; if multiple agents need the same file, make one owner and put the others after that owner with depends_on for review, tests, or dependent changes. "
         "Assign at least one specialist that writes implementation files and at least one that owns verification, tests, or review artifacts. "

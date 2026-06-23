@@ -849,7 +849,7 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertLess(agent_names.index("Frontend Sub-Orchestrator"), agent_names.index("Gameplay Engineer"))
                 self.assertIn("Verification: passed", run.summary)
 
-    def test_direct_specialist_runs_in_parallel_with_sub_orchestrators(self) -> None:
+    def test_initial_agents_follow_depends_on_across_sub_orchestrators(self) -> None:
         system_started = Event()
         frontend_started = Event()
         backend_started = Event()
@@ -913,14 +913,14 @@ class OrchestratorTests(unittest.TestCase):
                             },
                             {
                                 "name": "DevOps / Repo Scaffolding Specialist",
-                                "purpose": "Create repo scaffolding after architecture is known.",
-                                "task": "Write deployment notes after the system design is complete.",
-                                "input": "System design output.",
-                                "input_format": "Completed SPEC.md.",
+                                "purpose": "Create repo scaffolding after architecture and domain planning are known.",
+                                "task": "Write deployment notes after the system design and sub-orchestrator plans are complete.",
+                                "input": "System design output and completed domain plans.",
+                                "input_format": "Completed SPEC.md plus completed sub-orchestrator plans.",
                                 "expected_output_format": "DEPLOY.md.",
                                 "logic": "Use the architecture spec to document scaffolding.",
                                 "deliverable": "DEPLOY.md.",
-                                "depends_on": ["System Designer"],
+                                "depends_on": ["System Designer", "Frontend Sub-Orchestrator", "Backend Sub-Orchestrator"],
                             }
                         ],
                     }
@@ -991,7 +991,7 @@ class OrchestratorTests(unittest.TestCase):
                 with timing_lock:
                     timings["devops_start"] = time.perf_counter()
                 if not frontend_done.is_set() or not backend_done.is_set():
-                    raise AssertionError("Dependent direct specialist started before sub-orchestrator planning barrier.")
+                    raise AssertionError("Dependent direct specialist started before explicit sub-orchestrator dependencies.")
                 _call_tool(tools or [], "read_file", "SPEC.md")
                 _call_tool(tools or [], "write_file", "DEPLOY.md", "# Deploy\n\nScaffold after architecture and domain planning.\n")
                 return "Wrote DEPLOY.md."
@@ -1024,7 +1024,12 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertGreaterEqual(timings["devops_start"], timings["frontend_end"])
                 self.assertGreaterEqual(timings["devops_start"], timings["backend_end"])
                 system_designer = next(agent for agent in run.agents if agent.name == "System Designer")
+                devops = next(agent for agent in run.agents if agent.name == "DevOps / Repo Scaffolding Specialist")
                 self.assertEqual(system_designer.status, "done")
+                self.assertEqual(
+                    devops.depends_on,
+                    ["Orchestrator", "System Designer", "Frontend Sub-Orchestrator", "Backend Sub-Orchestrator"],
+                )
 
     def test_independent_specialists_run_in_parallel_before_dependents(self) -> None:
         spec_started = Event()
