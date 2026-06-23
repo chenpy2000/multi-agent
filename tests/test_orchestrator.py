@@ -853,6 +853,8 @@ class OrchestratorTests(unittest.TestCase):
         system_started = Event()
         frontend_started = Event()
         backend_started = Event()
+        frontend_done = Event()
+        backend_done = Event()
         timings: dict[str, float] = {}
         timing_lock = Lock()
 
@@ -908,6 +910,17 @@ class OrchestratorTests(unittest.TestCase):
                                 "logic": "Define shared interfaces.",
                                 "deliverable": "SPEC.md.",
                                 "depends_on": [],
+                            },
+                            {
+                                "name": "DevOps / Repo Scaffolding Specialist",
+                                "purpose": "Create repo scaffolding after architecture is known.",
+                                "task": "Write deployment notes after the system design is complete.",
+                                "input": "System design output.",
+                                "input_format": "Completed SPEC.md.",
+                                "expected_output_format": "DEPLOY.md.",
+                                "logic": "Use the architecture spec to document scaffolding.",
+                                "deliverable": "DEPLOY.md.",
+                                "depends_on": ["System Designer"],
                             }
                         ],
                     }
@@ -918,8 +931,10 @@ class OrchestratorTests(unittest.TestCase):
                 frontend_started.set()
                 if not system_started.wait(1):
                     raise AssertionError("System Designer did not run while Frontend Sub-Orchestrator was planning.")
+                time.sleep(0.2)
                 with timing_lock:
                     timings["frontend_end"] = time.perf_counter()
+                frontend_done.set()
                 return json.dumps(
                     {
                         "agents": [
@@ -942,6 +957,10 @@ class OrchestratorTests(unittest.TestCase):
                 backend_started.set()
                 if not system_started.wait(1):
                     raise AssertionError("System Designer did not run while Backend Sub-Orchestrator was planning.")
+                time.sleep(0.2)
+                with timing_lock:
+                    timings["backend_end"] = time.perf_counter()
+                backend_done.set()
                 return json.dumps(
                     {
                         "agents": [
@@ -968,6 +987,14 @@ class OrchestratorTests(unittest.TestCase):
                 with timing_lock:
                     timings["system_end"] = time.perf_counter()
                 return "Wrote SPEC.md."
+            if name == "DevOps / Repo Scaffolding Specialist":
+                with timing_lock:
+                    timings["devops_start"] = time.perf_counter()
+                if not frontend_done.is_set() or not backend_done.is_set():
+                    raise AssertionError("Dependent direct specialist started before sub-orchestrator planning barrier.")
+                _call_tool(tools or [], "read_file", "SPEC.md")
+                _call_tool(tools or [], "write_file", "DEPLOY.md", "# Deploy\n\nScaffold after architecture and domain planning.\n")
+                return "Wrote DEPLOY.md."
             if name == "Frontend Engineer":
                 _call_tool(tools or [], "write_file", "index.html", "<!doctype html>\n")
                 return "Wrote index.html."
@@ -990,9 +1017,12 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertEqual(run.status, "complete")
                 project_dir = Path(run.project_path)
                 self.assertTrue((project_dir / "SPEC.md").exists())
+                self.assertTrue((project_dir / "DEPLOY.md").exists())
                 self.assertTrue((project_dir / "index.html").exists())
                 self.assertTrue((project_dir / "api.py").exists())
                 self.assertLess(timings["system_start"], timings["frontend_end"])
+                self.assertGreaterEqual(timings["devops_start"], timings["frontend_end"])
+                self.assertGreaterEqual(timings["devops_start"], timings["backend_end"])
                 system_designer = next(agent for agent in run.agents if agent.name == "System Designer")
                 self.assertEqual(system_designer.status, "done")
 

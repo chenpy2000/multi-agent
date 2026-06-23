@@ -358,6 +358,7 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
                 parallel_emit,
                 relationship_agent,
                 run,
+                1,
             )
             planned_sub_orchestrator_results = sub_future.result()
             early_execution_summary = specialist_future.result()
@@ -402,7 +403,7 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
             content="Assigned dynamic agents: " + ", ".join(agent.name for agent in specialist_agents),
         )
     )
-    remaining_specialists = sub_orchestrator_specialists if early_execution_summary else specialist_agents
+    remaining_specialists = [agent for agent in specialist_agents if agent.status != "done"] if early_execution_summary else specialist_agents
     later_execution_summary = _run_specialist_dag(
         run.prompt,
         plan,
@@ -1063,6 +1064,7 @@ def _run_specialist_dag(
     emit: Emitter,
     relationship_agent: Agent | None = None,
     run: Run | None = None,
+    max_levels: int | None = None,
 ) -> str:
     if not specialist_agents:
         return "No specialist agents were required."
@@ -1077,6 +1079,8 @@ def _run_specialist_dag(
 
     summaries: list[str] = []
     for level_index, level in enumerate(levels, start=1):
+        if max_levels is not None and level_index > max_levels:
+            break
         level_names = ", ".join(agent.name for agent in level)
         emit(
             Message(

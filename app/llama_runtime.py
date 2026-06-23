@@ -15,6 +15,7 @@ from app.llm import configured_model, configured_reasoning_effort, require_opena
 
 
 ToolFunction = Callable[..., str]
+AGENT_MAX_ITERATIONS = 80
 
 
 def run_llama_agent(
@@ -58,7 +59,12 @@ def run_llama_agent(
                 timeout=float(timeout),
                 allow_parallel_tool_calls=False,
             )
-            response = await agent.run(user_msg=input_text)
+            try:
+                response = await agent.run(user_msg=input_text, max_iterations=AGENT_MAX_ITERATIONS)
+            except TypeError as exc:
+                if "max_iterations" not in str(exc):
+                    raise
+                response = await agent.run(user_msg=input_text)
             return str(response or "").strip()
         finally:
             await _close_llm_async_resources(llm)
