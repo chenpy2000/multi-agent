@@ -252,7 +252,7 @@ def run_project_workflow(run: Run, emit: Emitter) -> None:
         )
 
     _start_agent(orchestrator, emit)
-    plan_text = _run_llama_agent(
+    plan_text = _run_planner_llama_agent(
         orchestrator.name,
         _orchestrator_instructions(),
         _orchestrator_input(
@@ -944,6 +944,27 @@ def _run_llama_agent(
         raise ProjectRuntimeError(f"{name} failed: {exc}") from exc
 
 
+def _run_planner_llama_agent(
+    name: str,
+    instructions: str,
+    input_text: str,
+    max_tokens: int,
+    tools: list[ToolFunction] | None = None,
+    timeout: int = 120,
+) -> str:
+    try:
+        return _run_llama_agent(name, instructions, input_text, max_tokens, tools, timeout)
+    except ProjectRuntimeError as exc:
+        if tools and "did not produce output" in str(exc):
+            retry_instructions = (
+                f"{instructions} "
+                "If a context tool is unavailable or does not lead to a final response, continue from the provided context "
+                "and return the required JSON object now. Do not call tools in this retry."
+            )
+            return _run_llama_agent(name, retry_instructions, input_text, max_tokens, None, timeout)
+        raise
+
+
 def _run_sub_orchestrator_dag(
     user_prompt: str,
     plan: WorkflowPlan,
@@ -963,7 +984,7 @@ def _run_sub_orchestrator_dag(
             _emit_handoff(orchestrator, sub_orchestrator, f"Plan specialists for domain: {planned_sub_orchestrator.domain}", emit)
             _start_agent(sub_orchestrator, emit)
             future = executor.submit(
-                _run_llama_agent,
+                _run_planner_llama_agent,
                 sub_orchestrator.name,
                 _sub_orchestrator_instructions(planned_sub_orchestrator, plan),
                 _sub_orchestrator_input(user_prompt, plan, planned_sub_orchestrator, workspace),
@@ -1126,7 +1147,7 @@ def _workspace_tools(workspace: ProjectWorkspace) -> list[ToolFunction]:
         return json.dumps(workspace.search_files(query, limit), indent=2)
 
     def relationship_graph() -> str:
-        """Recommended for existing-project work: read the current direct file relationship map before editing connected files."""
+        """Recommended for existing-project work: read the current direct file relationship map for context, then continue with your required final response."""
         return workspace.relationship_graph()
 
     def write_file(path: str, content: str) -> str:
@@ -1161,7 +1182,7 @@ def _list_files_tool(workspace: ProjectWorkspace) -> ToolFunction:
 
 def _relationship_graph_tool(workspace: ProjectWorkspace) -> ToolFunction:
     def relationship_graph() -> str:
-        """Read the current direct file relationship map for the generated project workspace."""
+        """Read the current direct file relationship map for context, then continue with your required final response."""
         return workspace.relationship_graph()
 
     return relationship_graph
@@ -1474,6 +1495,7 @@ def _orchestrator_instructions() -> str:
         "For browser games, split gameplay logic, UI/rendering, styling, and quality/testing responsibilities. "
         "For an existing selected project, plan incremental change agents that inspect current files, name likely affected files in their tasks, "
         "use relationship_graph if available to understand direct file relationships, and avoid broad rewrites unless the user explicitly asks for them. "
+        "If you call relationship_graph, you must still return the required JSON workflow plan as your final response. "
         "Do not include Orchestrator, Project Builder, Verification Agent, or Review Agent in the agents list. "
         "Do not ask sub-orchestrators to create more sub-orchestrators; max hierarchy depth is 2."
     )
@@ -1534,6 +1556,7 @@ def _sub_orchestrator_instructions(sub_orchestrator: PlannedSubOrchestrator, pla
         "Set depends_on to only the specialist names in this domain that must finish first; use [] for parallelizable work. "
         "Within your domain, assign each writable source file to one primary specialist only; if multiple specialists need the same file, make one owner and sequence the others with depends_on for review, tests, or dependent changes. "
         "For existing projects, use relationship_graph if available before assigning specialists to connected files. "
+        "If you call relationship_graph, you must still return the required JSON specialist plan as your final response. "
         "Do not create nested sub-orchestrators. Do not include Orchestrator, Project Builder, Verification Agent, or Review Agent."
     )
 

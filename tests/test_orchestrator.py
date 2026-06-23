@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import Event, Lock
 from unittest.mock import patch
 
+from app import project_runtime
 from app.code_index import build_project_code_index, refresh_project_code_index_files
 from app.frameworks import current_framework_profile
 from app.models import Run
@@ -739,6 +740,56 @@ class OrchestratorTests(unittest.TestCase):
                 self.assertIn("Updated existing project", run.summary)
                 verifier = next(agent for agent in run.agents if agent.name == "Verification Agent")
                 self.assertIn("Modified:", verifier.output)
+
+    def test_planner_retries_without_tools_after_empty_tool_response(self) -> None:
+        calls: list[bool] = []
+
+        def fake_run_llama_agent(
+            name: str,
+            instructions: str,
+            input_text: str,
+            max_tokens: int,
+            tools: list | None = None,
+            timeout: int = 120,
+        ) -> str:
+            calls.append(bool(tools))
+            if tools:
+                raise ProjectRuntimeError(f"{name} failed: {name} did not produce output.")
+            return json.dumps(
+                {
+                    "project_name": "retry-plan",
+                    "project_summary": "Recovered without planner tools.",
+                    "acceptance_criteria": ["Return a valid plan"],
+                    "agents": [
+                        {
+                            "name": "Implementation Agent",
+                            "purpose": "Implement the requested change.",
+                            "task": "Write files.",
+                            "input": "Prompt.",
+                            "input_format": "Plain text.",
+                            "expected_output_format": "Files.",
+                            "logic": "Implement directly.",
+                            "deliverable": "Working files.",
+                        }
+                    ],
+                }
+            )
+
+        def relationship_graph() -> str:
+            return "Project relationship map:\n- `index.html` loads `app.js`."
+
+        with patch("app.project_runtime._run_llama_agent", fake_run_llama_agent):
+            output = project_runtime._run_planner_llama_agent(
+                "Orchestrator",
+                "Return only valid JSON.",
+                "User request: update an app",
+                1000,
+                [relationship_graph],
+                120,
+            )
+
+        self.assertEqual(calls, [True, False])
+        self.assertIn("retry-plan", output)
 
     def test_browser_tic_tac_toe_workflow_creates_executable_game(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
